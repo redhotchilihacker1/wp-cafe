@@ -1,0 +1,1 @@
+"use strict";(globalThis.webpackChunkwp_cafe||=[]).push([[561,723,1199,1352,3104,3580,5961,6437,6913,8342,8818,8971,9294],{38342(e,t,i){i.d(t,{z:()=>s});var n=i(29407);function s(e,t,i){const s=(0,n.a)(e,i?.in);return s.setTime(s.getTime()+6e4*t),s}}}]);

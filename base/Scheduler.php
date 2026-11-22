@@ -1,0 +1,520 @@
+<?php
+/**
+ * Init Main Class
+ *
+ * @package WpCafe/Init
+ */
+
+namespace WpCafe;
+
+use DateTime;
+use DatePeriod;
+use DateInterval;
+use WpCafe\Models\Reservation_Model;
+
+/**
+ * Restaurant Scheduler Class
+ *
+ * Generates time slots for restaurant schedules.
+ */
+
+ class Scheduler {
+
+    /**
+     * Restaurant schedule.
+     *
+     * @var array
+     */
+    protected $schedule;
+
+    /**
+     * Start date.
+     *
+     * @var string
+     */
+    protected $start_date;
+
+    /**
+     * End date.
+     *
+     * @var string
+     */
+    protected $end_date;
+
+    /**
+     * Interval in minutes.
+     *
+     * @var int
+     */
+    protected $interval;
+
+    /**
+     * Max seat.
+     *
+     * @var int
+     */
+    protected $max_seat;
+
+    /**
+     * Custom schedules.
+     *
+     * @var array
+     */
+    protected $custom_schedules;
+
+    /**
+     * Custom schedule enabled.
+     *
+     * @var bool
+     */
+    protected $enable_custom_schedule;
+
+    /**
+     * Custom holidays.
+     *
+     * @var array
+     */
+    protected $custom_holidays;
+
+    /**
+     * Custom holiday enabled.
+     *
+     * @var bool
+     */
+    protected $enable_custom_holiday;
+
+    /**
+     * Constructor.
+     *
+     * @param array  $schedule   Restaurant schedule.
+     * @param string $start_date Start date (Y-m-d).
+     * @param string $end_date   End date (Y-m-d).
+     * @param int    $total_capacity Total capacity.
+     * @param int    $location_id Optional location ID for location-specific settings.
+     */
+    public function __construct( $schedule, $start_date, $end_date, $total_capacity, $branch_id = null ) {
+        $this->schedule   = $schedule;
+        $this->start_date = $start_date;
+        $this->end_date   = $end_date;
+        $this->interval   = wpc_get_reservation_slot_interval( $branch_id );
+        $this->max_seat   = $total_capacity;
+        
+        $this->enable_custom_schedule = wpc_get_option('enable_custom_schedule', false);
+        $this->custom_schedules = wpc_get_option('custom_schedules', []);
+
+        $this->enable_custom_holiday = wpc_get_option('enable_custom_holiday', false);
+        $this->custom_holidays = wpc_get_option('custom_holidays', []);
+    }
+
+    /**
+     * Generate all slots within the date range.
+     *
+     * @return array
+     */
+    public function generate() {
+
+        if ( ! $this->schedule ) {
+            return [];
+        }
+
+        if ( ! $this->start_date || ! $this->end_date ) {
+            return [];
+        }
+
+        $result = array();
+        $period = new DatePeriod(
+            new DateTime( $this->start_date ),
+            new DateInterval( 'P1D' ),
+            ( new DateTime( $this->end_date ) )->modify( '+1 day' )
+        );
+
+        foreach ( $period as $date ) {
+            $formatted_date = $date->format( 'Y-m-d' );
+            $day = $date->format( 'D' );
+
+            // Check if date is a custom holiday - holidays take highest priority
+            if ( $this->enable_custom_holiday && $this->is_custom_holiday( $formatted_date ) ) {
+                $result[ $formatted_date ] = array(
+                    'status' => 'off',
+                    'slots'  => array(),
+                );
+                continue;
+            }
+
+            // Check custom schedule if enabled
+            if ( $this->enable_custom_schedule && $this->has_custom_schedule( $formatted_date ) ) {
+                $custom_schedule = $this->get_custom_schedule( $formatted_date );
+                $result[ $formatted_date ] = array(
+                    'status' => 'on',
+                    'slots'  => $this->generate_slots( $date, array( $custom_schedule ) ),
+                );
+                continue;
+            }
+
+            if ( ! isset( $this->schedule[ $day ] ) ) {
+                continue;
+            }
+
+            $day_schedule = $this->schedule[ $day ];
+            $status       = $day_schedule['status'];
+
+            $result[ $formatted_date ] = array(
+                'status' => $status,
+                'slots'  => ( 'on' === $status )
+                    ? $this->generate_slots( $date, $day_schedule['slots'] )
+                    : array(),
+            );
+        }
+
+        return $result;
+    }
+
+	/**
+	 * Days in the range a guest cannot book, by the same rules as generate().
+	 *
+	 * Skips the slot and seat lookups, so the admin calendar can ask for a whole
+	 * month cheaply. A day missing from the weekly schedule counts as closed,
+	 * as does an open day with no usable time range.
+	 *
+	 * @return string[] Dates as `Y-m-d`.
+	 */
+	public function closed_days() {
+		if ( ! $this->schedule || ! $this->start_date || ! $this->end_date ) {
+			return array();
+		}
+
+		$closed = array();
+		$period = new DatePeriod(
+			new DateTime( $this->start_date ),
+			new DateInterval( 'P1D' ),
+			( new DateTime( $this->end_date ) )->modify( '+1 day' )
+		);
+
+		foreach ( $period as $date ) {
+			$ranges = $this->ranges_for_date( $date );
+
+			if ( null === $ranges || ! $this->has_time_range( $ranges ) ) {
+				$closed[] = $date->format( 'Y-m-d' );
+			}
+		}
+
+		return $closed;
+	}
+
+	/**
+	 * Open days, opening hours and the earliest and latest hour in the range.
+	 *
+	 * Same day rules as closed_days(). A range that ends at or before its start
+	 * runs past midnight, so it gets 24 hours added.
+	 *
+	 * @return array{open_days:int, open_hours:float, first_hour:int|null, last_hour:int|null}
+	 *     `last_hour` is the last hour that has an opening minute in it, 0-23.
+	 */
+	public function opening_summary() {
+		$summary = array(
+			'open_days'  => 0,
+			'open_hours' => 0.0,
+			'first_hour' => null,
+			'last_hour'  => null,
+		);
+
+		if ( ! $this->schedule || ! $this->start_date || ! $this->end_date ) {
+			return $summary;
+		}
+
+		$period = new DatePeriod(
+			new DateTime( $this->start_date ),
+			new DateInterval( 'P1D' ),
+			( new DateTime( $this->end_date ) )->modify( '+1 day' )
+		);
+
+		foreach ( $period as $date ) {
+			$ranges = $this->ranges_for_date( $date );
+
+			if ( null === $ranges ) {
+				continue;
+			}
+
+			$day_minutes = 0;
+
+			foreach ( $ranges as $range ) {
+				$start = is_array( $range ) ? $this->parse_time( $range['start'] ?? '' ) : null;
+				$end   = is_array( $range ) ? $this->parse_time( $range['end'] ?? '' ) : null;
+
+				if ( ! $start || ! $end ) {
+					continue;
+				}
+
+				$start_minute = (int) $start->format( 'H' ) * 60 + (int) $start->format( 'i' );
+				$end_minute   = (int) $end->format( 'H' ) * 60 + (int) $end->format( 'i' );
+
+				if ( $end_minute <= $start_minute ) {
+					$end_minute += 24 * 60;
+				}
+
+				$day_minutes += $end_minute - $start_minute;
+
+				$first = intdiv( $start_minute, 60 );
+				// The minute before closing, so 22:00 ends on hour 21.
+				$last = min( 23, intdiv( $end_minute - 1, 60 ) );
+
+				$summary['first_hour'] = null === $summary['first_hour'] ? $first : min( $summary['first_hour'], $first );
+				$summary['last_hour']  = null === $summary['last_hour'] ? $last : max( $summary['last_hour'], $last );
+			}
+
+			if ( $day_minutes > 0 ) {
+				++$summary['open_days'];
+				$summary['open_hours'] += $day_minutes / 60;
+			}
+		}
+
+		return $summary;
+	}
+
+	/**
+	 * Opening time ranges for one date, from the same rules every day view uses.
+	 *
+	 * A custom holiday closes the day. A custom schedule replaces the weekly one.
+	 * Otherwise the weekday's slots count when that weekday is on.
+	 *
+	 * @param DateTime $date The date.
+	 * @return array|null Time ranges with `start` and `end` keys, or null for a holiday.
+	 */
+	protected function ranges_for_date( DateTime $date ) {
+		$formatted_date = $date->format( 'Y-m-d' );
+
+		if ( $this->enable_custom_holiday && $this->is_custom_holiday( $formatted_date ) ) {
+			return null;
+		}
+
+		if ( $this->enable_custom_schedule && $this->has_custom_schedule( $formatted_date ) ) {
+			return array( $this->get_custom_schedule( $formatted_date ) );
+		}
+
+		$day_schedule = $this->schedule[ $date->format( 'D' ) ] ?? null;
+
+		return ( $day_schedule && 'on' === ( $day_schedule['status'] ?? '' ) )
+			? (array) ( $day_schedule['slots'] ?? array() )
+			: array();
+	}
+
+	/**
+	 * Whether at least one range has a start and end that parse as times.
+	 *
+	 * @param array $ranges Time ranges with `start` and `end` keys.
+	 * @return bool
+	 */
+	protected function has_time_range( $ranges ) {
+		foreach ( $ranges as $range ) {
+			if ( is_array( $range ) && $this->parse_time( $range['start'] ?? '' ) && $this->parse_time( $range['end'] ?? '' ) ) {
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+    /**
+     * Generate slots for a single day.
+     *
+     * @param array $time_ranges Array of time ranges with start and end times.
+     *
+     * @return array
+     */
+    protected function generate_slots( $date, $time_ranges ) {
+        $slots = array();
+        $date = $date->format( 'Y-m-d' );
+
+        // Guard against 0/empty intervals saved by older versions - they would loop forever.
+        $interval = max( 1, (int) $this->interval );
+
+        foreach ( $time_ranges as $range ) {
+            $start = $this->parse_time( $range['start'] ?? '' );
+            $end   = $this->parse_time( $range['end'] ?? '' );
+
+            if ( ! $start || ! $end ) {
+                continue;
+            }
+
+            /*
+             * A closing time at or before the opening time means the day runs past
+             * midnight - "8:00 AM to 12:00 AM" is open until midnight, not a zero
+             * length day. Without this every such schedule returned no slots.
+             */
+            if ( $end <= $start ) {
+                $end->modify( '+1 day' );
+            }
+
+            while ( $start < $end ) {
+                $slot_start = clone $start;
+                $slot_end   = ( clone $start )->modify( '+' . $interval . ' minutes' );
+
+                if ( $slot_end > $end ) {
+                    break;
+                }
+
+                $slots[] = array(
+                    'start'          => $slot_start->format( get_option('time_format') ),
+                    'end'            => $slot_end->format( get_option('time_format') ),
+                    'status'         => $this->get_slot_status( $date,$slot_start, $slot_end ),
+                    'available_seat' => $this->get_available_seat( $date, $slot_start, $slot_end ),
+                );
+
+                $start = $slot_end;
+            }
+        }
+
+        return $slots;
+    }
+
+    /**
+     * Turn a stored schedule time into a DateTime on a fixed reference day.
+     *
+     * Times are meant to be saved as "8:00 AM", but schedules migrated from
+     * WP Cafe 2.x and sites on a 24-hour locale also carry "20:00" or "8h00",
+     * so fall back before giving up.
+     *
+     * @param string $time Time string from the schedule.
+     * @return DateTime|null Null when the value cannot be read.
+     */
+    protected function parse_time( $time ) {
+        $time = trim( (string) $time );
+
+        if ( '' === $time ) {
+            return null;
+        }
+
+        foreach ( array( 'h:i A', 'g:i A', 'H:i', 'G:i' ) as $format ) {
+            $parsed = DateTime::createFromFormat( $format, $time );
+
+            if ( $parsed instanceof DateTime ) {
+                // Unspecified fields inherit the current time, so pin seconds to 0.
+                return $parsed->setTime( (int) $parsed->format( 'H' ), (int) $parsed->format( 'i' ), 0 );
+            }
+        }
+
+        $timestamp = strtotime( $time );
+
+        if ( false === $timestamp ) {
+            return null;
+        }
+
+        return ( new DateTime() )->setTimestamp( $timestamp )->setTime(
+            (int) wp_date( 'H', $timestamp ),
+            (int) wp_date( 'i', $timestamp ),
+            0
+        );
+    }
+
+    /**
+     * Determine slot status.
+     *
+     * @param DateTime $start Start time.
+     * @param DateTime $end   End time.
+     *
+     * @return string
+     */
+    protected function get_slot_status( $date, $start, $end ) {
+        $total_booked_seat = $this->get_booked_seat($date, $start, $end);
+
+        return $total_booked_seat < $this->max_seat ? 'available' : 'unavailable';
+    }
+
+    /**
+     * Get available seat count.
+     *
+     * @param DateTime $start Start time.
+     * @param DateTime $end   End time.
+     *
+     * @return int
+     */
+    protected function get_available_seat( $date, $start, $end ) {
+        $total_booked_seat = Reservation_Model::get_total_guest_by_date_time( $date, $start, $end );
+
+        return $this->max_seat - $total_booked_seat;
+    }
+
+    /**
+     * Get booked seat
+     *
+     * @return  integer Total booked seat
+     */
+    protected function get_booked_seat($date, $start, $end) {
+        $total_booked_seat = Reservation_Model::get_total_guest_by_date_time( $date, $start, $end );
+
+        return $total_booked_seat;
+    }
+
+    /**
+     * Check if a custom schedule exists for the given date.
+     *
+     * @param string $date Date in Y-m-d format.
+     * @return bool
+     */
+    protected function has_custom_schedule( $date ) {
+        if ( empty( $this->custom_schedules ) ) {
+            return false;
+        }
+
+        foreach ( $this->custom_schedules as $schedule ) {
+            if ( isset( $schedule['date'] ) && $schedule['date'] === $date ) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Get custom schedule for the given date.
+     *
+     * @param string $date Date in Y-m-d format.
+     * @return array Schedule with 'start' and 'end' keys.
+     */
+    protected function get_custom_schedule( $date ) {
+        if ( empty( $this->custom_schedules ) ) {
+            return array();
+        }
+
+        foreach ( $this->custom_schedules as $schedule ) {
+            if ( isset( $schedule['date'] ) && $schedule['date'] === $date ) {
+                if ( isset( $schedule['time'] ) && is_array( $schedule['time'] ) ) {
+                    return $schedule['time'];
+                }
+            }
+        }
+
+        return array();
+    }
+
+    /**
+     * Check if a date is a custom holiday.
+     *
+     * @param string $date Date in Y-m-d format.
+     * @return bool True if the date is a custom holiday, false otherwise.
+     */
+    protected function is_custom_holiday( $date ) {
+        if ( empty( $this->custom_holidays ) ) {
+            return false;
+        }
+
+        // Convert input date to timestamp for comparison
+        $date_timestamp = strtotime( $date );
+        if ( ! $date_timestamp ) {
+            return false;
+        }
+
+        foreach ( $this->custom_holidays as $holiday ) {
+            $holiday_timestamp = strtotime( $holiday );
+            if ( ! $holiday_timestamp ) {
+                continue;
+            }
+
+            if ( wp_date( 'Y-m-d', $date_timestamp ) === wp_date( 'Y-m-d', $holiday_timestamp ) ) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+}

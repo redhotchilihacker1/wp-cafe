@@ -1,0 +1,203 @@
+<?php
+if ( ! defined( 'ABSPATH' ) ) exit;
+// phpcs:ignoreFile WordPress.NamingConventions.PrefixAllGlobals -- template scope; locally-extracted variables and third-party (Elementor) hook names.
+
+use WpCafe\Utils\Wpc_Utilities;
+use WpCafe\Core\Shortcodes\Template_Functions;
+
+// Exit if WooCommerce is not active.
+if ( ! class_exists( 'WooCommerce' ) ) {
+    return;
+}
+
+// Exit if no tabs are available.
+if ( empty( $food_menu_tabs ) || ! is_array( $food_menu_tabs ) ) {
+    return;
+}
+
+// Elementor filter hook.
+apply_filters( 'elementor/control/search_data', $settings, $unique_id, 'wpc-food-menu-tab' );
+
+// Sanitize and set defaults.
+$wpc_menu_count   = ! empty( $settings['wpc_menu_count'] ) ? intval( $settings['wpc_menu_count'] ) : 5;
+$wpc_show_desc    = ! empty( $settings['wpc_show_desc'] ) ? sanitize_text_field( $settings['wpc_show_desc'] ) : 'yes';
+$wpc_show_vendor  = ! empty( $settings['wpc_show_vendor'] ) ? sanitize_text_field( $settings['wpc_show_vendor'] ) : 'no';
+$show_thumbnail   = ! empty( $settings['show_thumbnail'] ) ? sanitize_text_field( $settings['show_thumbnail'] ) : 'yes';
+$title_link_show  = ! empty( $settings['title_link_show'] ) ? sanitize_text_field( $settings['title_link_show'] ) : 'yes';
+$show_pagination  = isset( $settings['show_pagination'] ) ? sanitize_text_field( $settings['show_pagination'] ) : 'yes';
+$class            = ( 'yes' === $title_link_show ) ? '' : 'wpc-no-link';
+
+// Column count for the new CSS grid styles. Separate from $wpc_menu_col, which
+// the pro tab styles use as a 12-column span.
+$grid_columns     = $settings['grid_columns'] ?? 3;
+$nav_config       = is_array( $settings['nav_config'] ?? null ) ? $settings['nav_config'] : [ 'nav' => 'default' ];
+$is_rail_layout   = ( 'rail' === ( $nav_config['nav'] ?? 'default' ) );
+
+// Brand tokens on the wrapper: every card and pill below reads them, and a
+// per-instance color beats the global setting without extra selectors.
+$wpc_color_style = wpc_color_tokens();
+?>
+
+<div class="wpc-food-tab-wrapper wpc-nav-shortcode main_wrapper_<?php echo esc_attr( $unique_id ); ?>" data-id="<?php echo esc_attr( $unique_id ); ?>"<?php if ( '' !== $wpc_color_style ) : ?> style="<?php echo esc_attr( $wpc_color_style ); ?>"<?php endif; ?>>
+
+    <?php if ( $is_rail_layout ) : ?>
+        <div class="wpc-tab-layout--rail">
+    <?php endif; ?>
+
+    <?php
+    Template_Functions::render_food_menu_tab_nav(
+        $food_menu_tabs,
+        [
+            'nav' => $nav_config['nav'] ?? 'default',
+        ]
+    );
+    ?>
+
+    <div class="wpc-tab-content wpc-widget-wrapper">
+        <?php foreach ( $food_menu_tabs as $content_key => $value ) : ?>
+            <?php if ( ! empty( $value['post_cats'][0] ) ) : ?>
+                <?php
+                $active_class = ( 0 === $content_key ) ? 'tab-active' : '';
+                $cat_id       = intval( $value['post_cats'][0] );
+
+                $current_page = 1;
+                if ( isset( $settings['_page_per_cat'][ $cat_id ] ) ) {
+                    $current_page = max( 1, (int) $settings['_page_per_cat'][ $cat_id ] );
+                } elseif ( isset( $settings['_page'] ) && isset( $settings['_active_cat'] ) && (int) $settings['_active_cat'] === $cat_id ) {
+                    $current_page = max( 1, (int) $settings['_page'] );
+                }
+
+                $food_tab_args = [
+                    'post_type'     => 'product',
+                    'no_of_product' => $wpc_menu_count,
+                    'wpc_cat'       => $value['post_cats'],
+                    'order'         => $wpc_menu_order,
+                    'page'          => $current_page,
+                ];
+
+                $selected_location = wpc_selected_location_id();
+                if ( ! empty( $selected_location ) ) {
+                    $food_tab_args['wpc_location'] = $selected_location;
+                }
+
+                $page_result = Wpc_Utilities::product_query_with_pagination( $food_tab_args );
+                $products    = $page_result['products'];
+                $total_pages = $page_result['total_pages'];
+
+                // Consumed by style-7's results counter, which re-renders with
+                // each AJAX page.
+                $wpc_result_total = $page_result['total_products'] ?? 0;
+                $wpc_current_page = $current_page;
+
+                $tab_product_data = array(
+                    'style'             => $style,
+                    'no_of_product'     => $wpc_menu_count,
+                    'wpc_menu_order'    => $wpc_menu_order,
+                    'wpc_cart_button'   => $wpc_cart_button,
+                    'wpc_price_show'    => $wpc_price_show,
+                    'wpc_show_desc'     => $wpc_show_desc,
+                    'product_thumbnail' => $show_thumbnail,
+                    'title_link_show'   => $title_link_show,
+                    'show_item_status'  => $show_item_status,
+                    // Without this the labels disappear on the second page.
+                    'show_item_label'   => $settings['show_item_label'] ?? 'no',
+                    'show_points'       => $settings['show_points'] ?? '',
+                    'wpc_desc_limit'    => $wpc_desc_limit,
+                    'wpc_show_vendor'   => $wpc_show_vendor ?? 'no',
+                    'show_pagination'   => $show_pagination,
+                    'cat_id'            => $cat_id,
+                    'post_cats'         => $value['post_cats'],
+                    'grid_columns'      => $grid_columns,
+                );
+
+                $menu_tab_args = [
+                    'active_class'     => $active_class,
+                    'content_key'      => $content_key,
+                    'cat_id'           => $cat_id,
+                    'unique_id'        => $unique_id,
+                    'products'         => $products,
+                    'style'            => $style,
+                    'wpc_cart_button'  => $wpc_cart_button,
+                    'wpc_price_show'   => $wpc_price_show,
+                    'wpc_show_desc'    => $wpc_show_desc,
+                    'show_thumbnail'   => $show_thumbnail,
+                    'title_link_show'  => $title_link_show,
+                    'show_item_status' => $show_item_status,
+                    'show_item_label'  => isset( $show_item_label ) ? $show_item_label : ( isset( $settings['show_item_label'] ) ? $settings['show_item_label'] : 'no' ),
+                    'show_points'      => isset( $show_points ) ? $show_points : ( isset( $settings['show_points'] ) ? $settings['show_points'] : '' ),
+                    'wpc_desc_limit'   => $wpc_desc_limit,
+                    'wpc_show_vendor'  => $wpc_show_vendor,
+                ];
+
+                extract( $menu_tab_args ); // phpcs:ignore WordPress.PHP.DontExtract.extract_extract
+                ?>
+                <div class="wpc-tab <?php echo esc_attr( $active_class ); ?>"
+                    data-id="tab_<?php echo intval( $content_key ); ?>"
+                    data-cat_id="<?php echo esc_attr( $cat_id ); ?>">
+
+                    <div class="tab_template_<?php echo esc_attr( "{$cat_id}_{$unique_id}" ); ?>"></div>
+
+                    <div class="template_data_<?php echo esc_attr( "{$cat_id}_{$unique_id}" ); ?>">
+                        <div class="wpc-paginated-products"
+                            data-shortcode="food_menu_tab"
+                            data-cat_id="<?php echo esc_attr( $cat_id ); ?>"
+                            data-current="<?php echo esc_attr( $current_page ); ?>"
+                            data-product_data="<?php echo esc_attr( wp_json_encode( $tab_product_data ) ); ?>">
+                            <div class="wpc-paginated-products-body">
+                                <?php
+                                // The shortcode already filters this, but the guard belongs at the sink too:
+                                // caller-side allowlists are exactly what the Elementor widgets slipped past.
+                                // style-3/4/5 belong to wpcafe-pro; the free styles continue at 6.
+                                $free_styles    = ['style-1', 'style-2', 'style-6', 'style-7', 'style-8'];
+                                $allowed_styles = ( function_exists( 'wpcafe_pro' ) || defined( 'WPCAFE_PRO_FILE' ) )
+                                    ? array_merge( $free_styles, ['style-3', 'style-4', 'style-5'] )
+                                    : $free_styles;
+                                $style    = in_array( $style, $allowed_styles, true ) ? $style : 'style-1';
+
+                                $template = trailingslashit( wpcafe()->plugin_directory ) . "/widgets/wpc-food-menu-tab/style/{$style}.php";
+                                if ( ! file_exists( $template ) && ( function_exists( 'wpcafe_pro' ) || defined( 'WPCAFE_PRO_FILE' ) ) ) {
+                                    if ( function_exists( 'wpcafe_pro' ) ) {
+                                        $pro_template = trailingslashit( wpcafe_pro()->plugin_directory ) . "/widgets/food-menu-tab/style/{$style}.php";
+                                        if ( file_exists( $pro_template ) ) {
+                                            $template = $pro_template;
+                                        }
+                                    }
+                                }
+
+                                if ( file_exists( $template ) ) {
+                                    // Add variables for pro styles compatibility
+                                    if ( ! isset( $wpc_menu_col ) ) {
+                                        $wpc_menu_col = 6;
+                                    }
+                                    if ( ! isset( $wpc_delivery_time_show ) ) {
+                                        $wpc_delivery_time_show = 'no';
+                                    }
+                                    if ( ! isset( $wpc_btn_text ) ) {
+                                        $wpc_btn_text = '';
+                                    }
+                                    if ( ! isset( $customize_btn ) ) {
+                                        $customize_btn = 'no';
+                                    }
+                                    include $template;
+                                }
+                                ?>
+                            </div>
+                            <?php
+                            if ( 'yes' === $show_pagination ) {
+                                echo Wpc_Utilities::render_menu_pagination( $current_page, $total_pages ); // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped
+                            }
+                            ?>
+                        </div>
+                    </div>
+                </div><!-- .wpc-tab -->
+            <?php endif; ?>
+        <?php endforeach; ?>
+    </div><!-- .wpc-tab-content -->
+
+    <?php if ( $is_rail_layout ) : ?>
+        </div><!-- .wpc-tab-layout--rail -->
+    <?php endif; ?>
+
+</div><!-- .wpc-food-tab-wrapper -->
+
+<?php return; ?>

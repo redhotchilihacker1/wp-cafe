@@ -1,0 +1,306 @@
+<?php
+namespace WpCafe\Settings\Controllers;
+
+use WP_REST_Server;
+use WpCafe\Abstract\Base_Rest_Controller;
+use WpCafe\Settings;
+
+/**
+ * Settings_Controller class. Handles settings related REST API requests.
+ *
+ * @package WpCafe/Settings/Controllers
+ */
+class Settings_Controller extends Base_Rest_Controller {
+    /**
+     * Setting keys safe to expose publicly (no webhook URLs, credentials, etc.).
+     */
+    private const PUBLIC_SETTING_KEYS = [
+        'reservation_form_customization',
+        'reservation_maximum_guest',
+        'reservation_minimum_guest',
+        'enable_custom_holiday',
+        'custom_holidays',
+        'calendar_language',
+        'wc_status',
+        'reservation_form_button_text',
+        'reservation_confirmation_button_text',
+        'reservation_cancellation_button_text',
+        'primary_color',
+        'secondary_color',
+        'require_location',
+        'display_location_selector',
+        'location_selector_pages',
+        'enable_floating_location_widget',
+        'reservation_booking_amount',
+        'multiply_booking_amount_with_guests',
+        'reservation_partial_payment',
+        'restaurant_type',
+        'reservation_status',
+        'enable_reservation_pending_message',
+        'reservation_pending_message',
+        'enable_reservation_confirmed_message',
+        'reservation_confirmed_message',
+        'block_timeslot_statuses',
+		// The booking form hides the table map when the system or staff pick.
+		'table_pick_mode',
+		'table_guest_picks_area',
+        'slot_interval',
+        'restaurant_schedule',
+        'enable_local_payment',
+        'enable_woocommerce_payments',
+        // The booking form tells a signed-out customer an account will be made.
+        'reservation_create_customer_account',
+		// Reservation form look; colors and sizes only, read by every visitor's form.
+		'reservation_form_style',
+
+        // Currency display formatting — non-sensitive; required by the front-end
+        // price renderer (reservation form + restaurant-management panel).
+        'currency',
+        'currency_symbol_position',
+        'currency_price_separator',
+        'currency_decimals',
+    ];
+
+    /**
+     * Integration credentials / webhook URLs. Stripped from the response for
+     * any caller without `manage_options`.
+     */
+    private const SENSITIVE_SETTING_KEYS = [
+        'whatsapp_token',
+        'whatsapp_facebook_app_id',
+        'whatsapp_facebook_app_secret',
+        'whatsapp_from_number_id',
+        'whatsapp_business_account_id',
+        'whatsapp_admin_number',
+        'fluentcrm_webhook_url',
+        'mailmint_webhook_url',
+        'zoho_flow_webhook_url',
+        'flowmattic_webhook_url',
+        'pabbly_webhook_url',
+        'zapier_webhook_url',
+        'funnelkit_webhook_url',
+        'uncanny_automator_webhook_url',
+    ];
+
+    /**
+     * Store the namespace for the REST API.
+     *
+     * @var string
+     */
+    protected $namespace = 'wpcafe/v2';
+
+    /**
+     * Store the REST base for the API.
+     *
+     * @var string
+     */
+    protected $rest_base = 'settings';
+
+    /**
+     * Register the REST routes for settings.
+     *
+     * @return void
+     */
+    public function register_routes() {
+        register_rest_route(
+            $this->namespace,
+            '/' . $this->rest_base,
+            [
+                [
+                    'methods'  => WP_REST_Server::READABLE,
+                    'callback' => [ $this, 'get_settings' ],
+                    'permission_callback' => [ $this, 'get_settings_check_permissions' ],
+                ],
+                [
+                    'methods'  => WP_REST_Server::EDITABLE,
+                    'callback' => [ $this, 'update_settings' ],
+                    'permission_callback' => [ $this, 'update_settings_check_permissions' ],
+                ]
+            ]
+        );
+
+        register_rest_route(
+            $this->namespace,
+            '/' . $this->rest_base . '/public',
+            [
+                'methods'             => WP_REST_Server::READABLE,
+                'callback'            => [ $this, 'get_public_settings' ],
+                'permission_callback' => [ $this, 'get_public_settings_permissions_check' ],
+            ]
+        );
+    }
+
+    /**
+     * Get settings.
+     *
+     * @param \WP_REST_Request $request The request object.
+     * @return \WP_REST_Response
+     */
+    public function get_settings( $request ) {
+        $settings = Settings::get();
+
+        $settings = apply_filters( 'wpcafe_settings', $settings );
+        $settings = is_array( $settings ) ? $settings : [];
+
+        $settings = $this->filter_sensitive_settings( $settings );
+
+        return $this->response( $settings );
+    }
+
+    /**
+     * Gate the full settings payload (which includes credentials) to store
+     * admins. The per-user panel caps (`wpcafe_view_own_*`) are deliberately
+     * excluded: they are granted to every subscriber/customer on activation, so
+     * trusting them would expose credentials. Panel views use `/settings/public`.
+     *
+     * Must return a strict bool — WordPress treats any non-`WP_Error`/non-false
+     * return (e.g. `$this->error()`) as "granted", so do not return that here.
+     *
+     * @param \WP_REST_Request|null $request The request object.
+     * @return bool
+     */
+    public function get_settings_check_permissions( $request = null ) {
+        $can_read = current_user_can( 'manage_options' ) || current_user_can( 'manage_woocommerce' );
+        $can_read = (bool) apply_filters( 'wpcafe_settings_read_permission', $can_read, $request );
+
+        if ( ! $can_read ) {
+            return false;
+        }
+
+        if ( $request instanceof \WP_REST_Request && ! $this->verify_rest_nonce( $request ) ) {
+            return false;
+        }
+
+        return true;
+    }
+
+    /**
+     * Remove credential keys from the payload unless the caller is a full
+     * administrator. Defense-in-depth so secrets never reach non-admins.
+     *
+     * @param  array $settings Full settings payload.
+     * @return array
+     */
+    private function filter_sensitive_settings( array $settings ): array {
+        $expose_secrets = (bool) apply_filters( 'wpcafe_settings_expose_sensitive', current_user_can( 'manage_options' ) );
+
+        if ( $expose_secrets ) {
+            return $settings;
+        }
+
+        $sensitive_keys = apply_filters( 'wpcafe_sensitive_setting_keys', self::SENSITIVE_SETTING_KEYS );
+        $sensitive_keys = is_array( $sensitive_keys ) ? $sensitive_keys : self::SENSITIVE_SETTING_KEYS;
+
+        return array_diff_key( $settings, array_flip( $sensitive_keys ) );
+    }
+
+    /**
+     * Permission check for public settings endpoint.
+     * Intentionally public — only keys in PUBLIC_SETTING_KEYS are exposed.
+     *
+     * @return bool
+     */
+    public function get_public_settings_permissions_check(): bool {
+        return true;
+    }
+
+    /**
+     * Get public (whitelisted) settings safe for unauthenticated access.
+     *
+     * @param \WP_REST_Request $request
+     * @return \WP_HTTP_Response
+     */
+    public function get_public_settings( $request ) {
+        $all_settings = Settings::get();
+
+        // Run the same filter the admin endpoints use so computed defaults are
+        // present. Currency/decimals/etc. are injected here from WooCommerce
+        // (see Default_Settings::add_default_seetings); without this the raw
+        // saved option is returned and the front-end shows a stale currency.
+        $all_settings = apply_filters( 'wpcafe_settings', $all_settings );
+        $all_settings = is_array( $all_settings ) ? $all_settings : [];
+
+        $public_keys  = apply_filters( 'wpcafe_public_setting_keys', self::PUBLIC_SETTING_KEYS );
+        $public       = array_intersect_key( $all_settings, array_flip( $public_keys ) );
+
+        /*
+		 * Hand the form Deposet's rule so the deposit updates live as the guest
+		 * count changes. Display only: the server works the deposit out again
+		 * when the booking is saved.
+         */
+		$deposit_rule = ! empty( $all_settings['reservation_partial_payment'] ) ? wpc_deposet_rule() : null;
+
+		if ( $deposit_rule ) {
+            $public['wpc_deposit'] = [
+                'enabled' => true,
+				'type'    => $deposit_rule['type'],
+				'amount'  => $deposit_rule['amount'],
+				'force'   => $deposit_rule['force'],
+				'default' => $deposit_rule['default'],
+            ];
+        } else {
+            $public['wpc_deposit'] = [ 'enabled' => false ];
+        }
+
+        return $this->response( $public );
+    }
+
+    /**
+     * Update settings.
+     *
+     * @return \WP_REST_Response
+     */
+    public function update_settings( $request ) {
+        $params = $request->get_params();
+
+        // Strip WP REST API internal parameters — not settings data.
+        foreach ( [ '_locale', '_fields', '_embed', '_jsonp', '_method' ] as $internal ) {
+            unset( $params[ $internal ] );
+        }
+
+        /*
+         * Keys owned by another screen. The settings form still carries them in
+         * its payload because it echoes back everything it loaded, so saving an
+         * old form would revert a newer value set elsewhere.
+         */
+        unset( $params['default_receipt_layout_id'] );
+
+        /*
+         * Live plugin-activation flags. Default_Settings computes them fresh on
+         * every read, so a stored copy is only a stale lie waiting to be read.
+         */
+        foreach ( [ 'wc_status', 'optiontics_status', 'aisentic_status' ] as $computed ) {
+            unset( $params[ $computed ] );
+        }
+
+        Settings::update( $params );
+
+        return $this->get_item( $request );
+    }
+
+    /**
+     * Check permissions for updating settings.
+     *
+     * @return bool
+     */
+    public function update_settings_check_permissions( $request ) {
+        return current_user_can( 'manage_options' );
+    }
+
+    /**
+     * Get a collection of items.
+     *
+     * @param WP_REST_Request $request Full data about the request.
+     * @return WP_Error|WP_REST_Response
+     */
+    public function get_item( $request ) {
+        $settings = Settings::get();
+
+        $settings = apply_filters( 'wpcafe_settings', $settings );
+        $settings = is_array( $settings ) ? $settings : [];
+
+        $settings = $this->filter_sensitive_settings( $settings );
+
+        return $this->response( $settings );
+    }
+}
